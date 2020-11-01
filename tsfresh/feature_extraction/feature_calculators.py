@@ -25,6 +25,8 @@ from collections import defaultdict
 
 import numpy as np
 import pandas as pd
+from numba import njit, jit, prange
+from numba.typed import Dict as TypedDict
 from numpy.linalg import LinAlgError
 from scipy.signal import cwt, find_peaks_cwt, ricker, welch
 from scipy.stats import linregress
@@ -1617,6 +1619,72 @@ def sample_entropy(x):
     return -np.log(A / B)
 
 
+@njit(parallel=False)
+def _sample_entropy_compiled_subfunction(xm, tolerance):
+    to_sum = []
+    for xmi in xm:
+        absolute = np.abs(xmi - xm)
+        to_sum.append(np.sum(np.array([absolute[i, :].max() for i in prange(xm.shape[0])]) <= tolerance) - 1)
+
+    return to_sum
+
+
+# todo - include latex formula
+# todo - check if vectorizable
+@set_property("high_comp_cost", True)
+@set_property("fctype", "simple")
+def optimized_sample_entropy(x):
+    """
+    Calculate and return sample entropy of x.
+
+    .. rubric:: References
+
+    |  [1] http://en.wikipedia.org/wiki/Sample_Entropy
+    |  [2] https://www.ncbi.nlm.nih.gov/pubmed/10843903?dopt=Abstract
+
+    :param x: the time series to calculate the feature of
+    :type x: numpy.ndarray
+
+    :return: the value of this feature
+    :return type: float
+    """
+    x = np.array(x)
+
+    # if one of the values is NaN, we can not compute anything meaningful
+    if np.isnan(x).any():
+        return np.nan
+
+    m = 2  # common value for m, according to wikipedia...
+    tolerance = 0.2 * np.std(x)  # 0.2 is a common value for r, according to wikipedia...
+
+    # Split time series and save all templates of length m
+    # Basically we turn [1, 2, 3, 4] into [1, 2], [2, 3], [3, 4]
+    xm = _into_subchunks(x, m)
+
+    # Now calculate the maximum distance between each of those pairs
+    #   np.abs(xmi - xm).max(axis=1)
+    # and check how many are below the tolerance.
+    # For speed reasons, we are not doing this in a nested for loop,
+    # but with numpy magic.
+    # Example:
+    # if x = [1, 2, 3]
+    # then xm = [[1, 2], [2, 3]]
+    # so we will substract xm from [1, 2] => [[0, 0], [-1, -1]]
+    # and from [2, 3] => [[1, 1], [0, 0]]
+    # taking the abs and max gives us:
+    # [0, 1] and [1, 0]
+    # as the diagonal elements are always 0, we substract 1.
+    B = np.sum(_sample_entropy_compiled_subfunction(xm, tolerance))
+
+    # Similar for computing A
+    xmp1 = _into_subchunks(x, m + 1)
+
+    A = np.sum(_sample_entropy_compiled_subfunction(xmp1, tolerance))
+
+    # Return SampEn
+    return -np.log(A / B)
+
+
 @set_property("fctype", "simple")
 @set_property("high_comp_cost", True)
 def approximate_entropy(x, m, r):
@@ -2036,6 +2104,7 @@ def agg_linear_trend(x, param):
     # todo: we could use the index of the DataFrame here
 
     calculated_agg = defaultdict(dict)
+
     res_data = []
     res_index = []
 
